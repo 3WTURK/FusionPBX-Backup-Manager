@@ -1,0 +1,123 @@
+<?php
+/*
+	Schedule Runner - Executes scheduled backups
+*/
+
+require_once dirname(__DIR__, 3) . "/resources/require.php";
+
+$schedule_uuid = $argv[1] ?? '';
+
+if (empty($schedule_uuid)) {
+	exit("Schedule UUID required\n");
+}
+
+//get schedule details
+$sql = "SELECT * FROM v_backup_schedules WHERE backup_schedule_uuid = :schedule_uuid AND schedule_enabled = 'true'";
+$parameters['schedule_uuid'] = $schedule_uuid;
+$database = new database;
+$schedule = $database->select($sql, $parameters, 'row');
+
+if (empty($schedule)) {
+	exit("Schedule not found or disabled\n");
+}
+
+//create backup
+$backup_uuid = uuid();
+
+$array['backup_manager'][0]['backup_manager_uuid'] = $backup_uuid;
+$array['backup_manager'][0]['domain_uuid'] = $schedule['domain_uuid'];
+$array['backup_manager'][0]['backup_type'] = $schedule['backup_type'];
+$array['backup_manager'][0]['backup_status'] = 'pending';
+$array['backup_manager'][0]['backup_progress'] = 0;
+$array['backup_manager'][0]['backup_date'] = date('Y-m-d H:i:s');
+$array['backup_manager'][0]['insert_date'] = date('Y-m-d H:i:s');
+$array['backup_manager'][0]['insert_user'] = 'system';
+
+$database->app_name = 'backup_manager';
+$database->app_uuid = 'b3d4e7f2-8c9a-4d5e-9f6a-1b2c3d4e5f6a';
+$database->save($array);
+unset($array);
+
+//start backup processor
+$processor_path = dirname(__FILE__) . "/standalone_backup_processor.php";
+$log_path = "/tmp/backup_scheduled_" . $backup_uuid . ".log";
+$cmd = "/usr/bin/php " . escapeshellarg($processor_path) . " " . escapeshellarg($backup_uuid) . " > " . escapeshellarg($log_path) . " 2>&1 &";
+exec($cmd);
+
+//update schedule last_run and next_run
+$array['backup_schedules'][0]['backup_schedule_uuid'] = $schedule_uuid;
+$array['backup_schedules'][0]['last_run'] = date('Y-m-d H:i:s');
+$array['backup_schedules'][0]['next_run'] = calculate_next_run($schedule);
+
+$database->app_name = 'backup_manager';
+$database->app_uuid = 'b3d4e7f2-8c9a-4d5e-9f6a-1b2c3d4e5f6a';
+$database->save($array);
+
+//cleanup old backups based on retention policy
+cleanup_old_backups($schedule['domain_uuid'], $schedule['retention_days']);
+
+echo "Scheduled backup started: " . $backup_uuid . "\n";
+
+function calculate_next_run($schedule) {
+	$now = new DateTime();
+	$next = new DateTime();
+	
+	list($hour, $minute) = explode(':', $schedule['schedule_time']);
+	
+	switch ($schedule['schedule_frequency']) {
+		case 'hourly':
+			$next->modify('+1 hour');
+			$next->setTime($next->format('H'), $minute);
+			break;
+			
+		case 'daily':
+			$next->modify('+1 day');
+			$next->setTime($hour, $minute);
+			break;
+			
+		case 'weekly':
+			$next->modify('+1 week');
+			$next->setTime($hour, $minute);
+			break;
+			
+		case 'monthly':
+			$next->modify('+1 month');
+			$next->setDate($next->format('Y'), $next->format('m'), min($schedule['schedule_day'], $next->format('t')));
+			$next->setTime($hour, $minute);
+			break;
+	}
+	
+	return $next->format('Y-m-d H:i:s');
+}
+
+function cleanup_old_backups($domain_uuid, $retention_days) {
+	$cutoff_date = date('Y-m-d H:i:s', strtotime("-{$retention_days} days"));
+	
+	$sql = "SELECT backup_manager_uuid, backup_path FROM v_backup_manager ";
+	$sql .= "WHERE domain_uuid = :domain_uuid ";
+	$sql .= "AND backup_date < :cutoff_date ";
+	$sql .= "AND backup_status = 'completed'";
+	
+	$parameters['domain_uuid'] = $domain_uuid;
+	$parameters['cutoff_date'] = $cutoff_date;
+	
+	$database = new database;
+	$old_backups = $database->select($sql, $parameters, 'all');
+	
+	if (is_array($old_backups)) {
+		foreach ($old_backups as $backup) {
+			//delete file
+			if (!empty($backup['backup_path']) && file_exists($backup['backup_path'])) {
+				unlink($backup['backup_path']);
+			}
+			
+			//delete record
+			$sql = "DELETE FROM v_backup_manager WHERE backup_manager_uuid = :backup_uuid";
+			$params['backup_uuid'] = $backup['backup_manager_uuid'];
+			$database->execute($sql, $params);
+			
+			echo "Cleaned up old backup: " . $backup['backup_manager_uuid'] . "\n";
+		}
+	}
+}
+?>
